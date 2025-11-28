@@ -1,2 +1,4 @@
 # scommit
-smart git commit
+sit back and smart git commit. no fuss, no worries.
+
+
