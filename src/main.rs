@@ -476,6 +476,95 @@ fn recent_commit_subjects(n: usize) -> Result<Vec<String>> {
         .collect())
 }
 
+fn sanitize_json_blob(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+
+    // If fenced (``` or ```json), strip fence and grab JSON object inside.
+    if trimmed.starts_with("```") {
+        if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+            if start < end {
+                return Some(trimmed[start..=end].to_string());
+            }
+        }
+    }
+
+    // Otherwise slice from first '{' to last '}'.
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            return Some(trimmed[start..=end].to_string());
+        }
+    }
+
+    None
+}
+
+fn strip_bullet_prefix(line: &str) -> &str {
+    line.trim().trim_start_matches(&['-', '•'][..]).trim_start()
+}
+
+fn coerce_subject(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(extract_text)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn coerce_body(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        Some(serde_json::Value::Array(items)) => {
+            let lines: Vec<String> = items
+                .iter()
+                .filter_map(extract_text)
+                .map(|l| {
+                    let cleaned = strip_bullet_prefix(&l);
+                    format!("- {}", cleaned)
+                })
+                .collect();
+            lines.join("\n")
+        }
+        Some(serde_json::Value::Object(map)) => {
+            // Some models nest body under "bullets" or "lines".
+            if let Some(bullets) = map.get("bullets").or_else(|| map.get("lines")) {
+                return coerce_body(Some(bullets));
+            }
+            if let Some(text) = extract_text(&serde_json::Value::Object(map.clone())) {
+                return text.trim().to_string();
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn extract_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Array(items) => {
+            let joined: Vec<String> = items.iter().filter_map(extract_text).collect();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined.join("\n"))
+            }
+        }
+        serde_json::Value::Object(map) => {
+            // Look for common textual keys.
+            for key in ["text", "value", "content", "message", "summary"] {
+                if let Some(v) = map.get(key) {
+                    if let Some(s) = extract_text(v) {
+                        return Some(s);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn diff_stat() -> Result<String> {
     Ok(git_output(&["diff", "--cached", "--stat", "--no-color"])?
         .trim()
@@ -503,12 +592,7 @@ struct ChatResponse {
     choices: Vec<Choice>,
 }
 
-#[derive(Deserialize)]
-struct AiCommit {
-    subject: String,
-    body: String,
-}
-
+// Extract a JSON blob even if the model wrapped it in markdown fences.
 fn ai_commit_message(
     changes: &[FileChange],
     stats: &Stats,
@@ -520,7 +604,7 @@ fn ai_commit_message(
     };
 
     let stat = diff_stat().unwrap_or_default();
-    let patch = diff_excerpt(2000).unwrap_or_default();
+    let patch = diff_excerpt(4000).unwrap_or_default();
 
     let recent = recent_commit_subjects(6).unwrap_or_default();
     let mut change_lines = String::new();
@@ -545,7 +629,7 @@ fn ai_commit_message(
     }
 
     let prompt = format!(
-        "Repo stats: files {}, +{}, -{}; categories {:?}; new {}, removed {}.\nRecent commit subjects:\n- {}\nChanges (staged):\n{}\n\nDiffstat:\n{}\n\nDiff excerpt (trimmed):\n{}",
+        "Repo stats: files {}, +{}, -{}; categories {:?}; new {}, removed {}.\nRecent commit subjects:\n- {}\nChanges (staged):\n{}\n\nDiffstat:\n{}\n\nDiff excerpt (trimmed):\n{}\n\nWrite 2-5 bullets that capture the most meaningful changes (what/why), call out new commands/flags/examples or config/doc topics when present, and note any behavioral impacts or risks. Avoid generic wording; be specific to these changes.",
         stats.files,
         stats.added,
         stats.deleted,
@@ -563,7 +647,7 @@ fn ai_commit_message(
         .build()
         .context("building http client")?;
 
-    let system = "You are a git commit assistant. Produce informative, specific commit messages that mirror the repo's tone. Respond strictly as JSON with keys \"subject\" and \"body\". Subject <=72 chars, sentence case, no trailing period. Body: 2-5 bullets, describe what changed and why, call out docs/flags/config shifts, and mention notable impacts.";
+    let system = "You are a git commit assistant. Produce informative, specific commit messages that mirror the repo's tone. Respond strictly as JSON with keys \"subject\" and \"body\". Subject <=72 chars, sentence case, no trailing period. Body must be 2-5 bullets starting with '- ', focusing on concrete changes and motivations; mention new commands/flags/examples, doc sections touched, and any behavioral impacts.";
 
     let payload = serde_json::json!({
         "model": model,
@@ -572,8 +656,8 @@ fn ai_commit_message(
             { "role": "user", "content": prompt }
         ],
         "response_format": { "type": "json_object" },
-        "temperature": 0.2,
-        "max_tokens": 320
+        "temperature": 0.25,
+        "max_tokens": 480
     });
 
     let res = client
@@ -594,9 +678,17 @@ fn ai_commit_message(
         None => return Ok(None),
     };
 
-    let ai: AiCommit = serde_json::from_str(&content).context("decoding AI json")?;
-    let subject = ai.subject.trim().to_string();
-    let body = ai.body.trim().to_string();
+    let json_blob = sanitize_json_blob(&content).ok_or_else(|| {
+        anyhow!(
+            "AI response missing JSON object: {}",
+            content.chars().take(200).collect::<String>()
+        )
+    })?;
+
+    let ai: serde_json::Value = serde_json::from_str(&json_blob).context("decoding AI json")?;
+    let subject = coerce_subject(ai.get("subject"))
+        .ok_or_else(|| anyhow!("AI JSON missing usable subject"))?;
+    let body = coerce_body(ai.get("body"));
 
     if subject.is_empty() {
         return Ok(None);
