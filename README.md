@@ -1,0 +1,2 @@
+# scommit
+smart git commit
