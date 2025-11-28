@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Smart git commit helper")]
@@ -28,6 +30,14 @@ struct Cli {
     /// Provide a custom commit message subject (auto body will still be added)
     #[arg(long, short = 'm')]
     message: Option<String>,
+
+    /// Disable AI generation even if OPENAI_API_KEY is present
+    #[arg(long)]
+    no_ai: bool,
+
+    /// Override OpenAI model (default: gpt-4o-mini or env SCOMMIT_MODEL)
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,9 +105,23 @@ fn main() -> Result<()> {
 
     let changes = collect_staged_changes()?;
     let stats = compute_stats(&changes);
+    let ai_enabled = !cli.no_ai && env::var("OPENAI_API_KEY").is_ok();
+    let model = cli
+        .model
+        .or_else(|| env::var("SCOMMIT_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+
     let (subject, body) = match cli.message {
         Some(subject) => (subject, build_body(&changes, &stats)),
-        None => build_commit_message(&changes, &stats),
+        None if ai_enabled => match ai_commit_message(&changes, &stats, &model) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => build_commit_message(&changes, &stats),
+            Err(e) => {
+                eprintln!("AI generation failed ({e}); falling back to heuristic.");
+                build_commit_message(&changes, &stats)
+            }
+        },
+        _ => build_commit_message(&changes, &stats),
     };
 
     if cli.dry_run {
@@ -440,6 +464,128 @@ fn short_name(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn recent_commit_subjects(n: usize) -> Result<Vec<String>> {
+    let out = git_output(&["log", "-n", &n.to_string(), "--pretty=%s"])?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct ChoiceMessage {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    message: ChoiceMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct AiCommit {
+    subject: String,
+    body: String,
+}
+
+fn ai_commit_message(
+    changes: &[FileChange],
+    stats: &Stats,
+    model: &str,
+) -> Result<Option<(String, String)>> {
+    let key = match env::var("OPENAI_API_KEY") {
+        Ok(k) => k,
+        Err(_) => return Ok(None),
+    };
+
+    let recent = recent_commit_subjects(6).unwrap_or_default();
+    let mut change_lines = String::new();
+    for c in changes.iter().take(24) {
+        let (action, detail) = match &c.status {
+            FileStatus::Added => ("add", c.path.clone()),
+            FileStatus::Modified => ("update", c.path.clone()),
+            FileStatus::Deleted => ("remove", c.path.clone()),
+            FileStatus::Renamed { from, .. } => ("rename", format!("{from} -> {}", c.path)),
+        };
+        use std::fmt::Write;
+        writeln!(
+            &mut change_lines,
+            "{} {} (+{}/-{}) [{}]",
+            action,
+            detail,
+            c.added,
+            c.deleted,
+            CATEGORY_NAMES.get(&c.category).copied().unwrap_or("other")
+        )
+        .ok();
+    }
+
+    let prompt = format!(
+        "Repo stats: files {}, +{}, -{}; categories {:?}; new {}, removed {}.\nRecent commit subjects:\n- {}\nChanges (staged):\n{}",
+        stats.files,
+        stats.added,
+        stats.deleted,
+        stats.categories,
+        stats.new_files,
+        stats.removed_files,
+        recent.join("\n- "),
+        change_lines
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("building http client")?;
+
+    let system = "You are a git commit assistant. Produce concise commit messages that match the repository style. Respond strictly as JSON with keys \"subject\" and \"body\". Subject <=72 chars, sentence case, no trailing period. Body should be bullet-ish plain text; mention the most important changes and totals.";
+
+    let payload = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": prompt }
+        ],
+        "response_format": { "type": "json_object" },
+        "temperature": 0.2,
+        "max_tokens": 320
+    });
+
+    let res = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&payload)
+        .send()
+        .context("calling OpenAI API")?;
+
+    if !res.status().is_success() {
+        bail!("OpenAI API error: {}", res.status());
+    }
+
+    let parsed: ChatResponse = res.json().context("parsing OpenAI response")?;
+    let choice = parsed.choices.into_iter().next();
+    let content = match choice {
+        Some(c) => c.message.content,
+        None => return Ok(None),
+    };
+
+    let ai: AiCommit = serde_json::from_str(&content).context("decoding AI json")?;
+    let subject = ai.subject.trim().to_string();
+    let body = ai.body.trim().to_string();
+
+    if subject.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some((subject, body)))
 }
 
 fn create_commit(subject: &str, body: &str) -> Result<()> {
