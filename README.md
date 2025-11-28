@@ -28,6 +28,26 @@ scommit --no-ai     # turn off AI generation even when OPENAI_API_KEY is set
 scommit --model gpt-4o # override OpenAI model (default: gpt-4o-mini or $SCOMMIT_MODEL)
 ```
 
+### Examples
+
+```bash
+# See what would happen without touching git history
+scommit --dry-run
+
+# Use already staged changes and skip AI
+git add src/lib.rs
+scommit --no-stage --no-ai
+
+# Override the AI model and avoid auto rebase/push
+scommit --model gpt-4o --skip-pull --no-push
+
+# Force the subject line but keep auto body
+scommit -m "fix: handle empty input"
+
+# Minimal: stage everything, let AI craft the message, commit, rebase if needed, push
+scommit
+```
+
 ## How messages are built
 
 - Categorizes files (docs/tests/config/code/other) and totals additions/deletions.

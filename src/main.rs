@@ -476,6 +476,18 @@ fn recent_commit_subjects(n: usize) -> Result<Vec<String>> {
         .collect())
 }
 
+fn diff_stat() -> Result<String> {
+    Ok(git_output(&["diff", "--cached", "--stat", "--no-color"])?
+        .trim()
+        .to_string())
+}
+
+fn diff_excerpt(max_chars: usize) -> Result<String> {
+    let raw = git_output(&["diff", "--cached", "--unified=3", "--no-color"])?;
+    let excerpt: String = raw.chars().take(max_chars).collect();
+    Ok(excerpt)
+}
+
 #[derive(Deserialize)]
 struct ChoiceMessage {
     content: String,
@@ -507,6 +519,9 @@ fn ai_commit_message(
         Err(_) => return Ok(None),
     };
 
+    let stat = diff_stat().unwrap_or_default();
+    let patch = diff_excerpt(2000).unwrap_or_default();
+
     let recent = recent_commit_subjects(6).unwrap_or_default();
     let mut change_lines = String::new();
     for c in changes.iter().take(24) {
@@ -530,7 +545,7 @@ fn ai_commit_message(
     }
 
     let prompt = format!(
-        "Repo stats: files {}, +{}, -{}; categories {:?}; new {}, removed {}.\nRecent commit subjects:\n- {}\nChanges (staged):\n{}",
+        "Repo stats: files {}, +{}, -{}; categories {:?}; new {}, removed {}.\nRecent commit subjects:\n- {}\nChanges (staged):\n{}\n\nDiffstat:\n{}\n\nDiff excerpt (trimmed):\n{}",
         stats.files,
         stats.added,
         stats.deleted,
@@ -538,7 +553,9 @@ fn ai_commit_message(
         stats.new_files,
         stats.removed_files,
         recent.join("\n- "),
-        change_lines
+        change_lines,
+        stat,
+        patch
     );
 
     let client = reqwest::blocking::Client::builder()
@@ -546,7 +563,7 @@ fn ai_commit_message(
         .build()
         .context("building http client")?;
 
-    let system = "You are a git commit assistant. Produce concise commit messages that match the repository style. Respond strictly as JSON with keys \"subject\" and \"body\". Subject <=72 chars, sentence case, no trailing period. Body should be bullet-ish plain text; mention the most important changes and totals.";
+    let system = "You are a git commit assistant. Produce informative, specific commit messages that mirror the repo's tone. Respond strictly as JSON with keys \"subject\" and \"body\". Subject <=72 chars, sentence case, no trailing period. Body: 2-5 bullets, describe what changed and why, call out docs/flags/config shifts, and mention notable impacts.";
 
     let payload = serde_json::json!({
         "model": model,
