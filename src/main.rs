@@ -761,3 +761,121 @@ fn git_output(args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn categorize_detects_common_path_types() {
+        assert_eq!(categorize("README.md"), Category::Docs);
+        assert_eq!(categorize("tests/scommit_spec.snap"), Category::Tests);
+        assert_eq!(categorize("config/settings.toml"), Category::Config);
+        assert_eq!(categorize("src/main.rs"), Category::Code);
+        assert_eq!(categorize("assets/logo.svg"), Category::Other);
+    }
+
+    #[test]
+    fn choose_prefix_uses_category_and_diff_shape() {
+        let mut docs_only = Stats::default();
+        docs_only.categories.insert(Category::Docs, 2);
+        assert_eq!(choose_prefix(&docs_only), "docs");
+
+        let mut feat_stats = Stats::default();
+        feat_stats.categories.insert(Category::Code, 1);
+        feat_stats.new_files = 1;
+        feat_stats.added = 24;
+        feat_stats.deleted = 3;
+        assert_eq!(choose_prefix(&feat_stats), "feat");
+
+        let mut refactor_stats = Stats::default();
+        refactor_stats.categories.insert(Category::Code, 2);
+        refactor_stats.added = 4;
+        refactor_stats.deleted = 19;
+        assert_eq!(choose_prefix(&refactor_stats), "refactor");
+    }
+
+    #[test]
+    fn build_subject_picks_top_files_and_truncates() {
+        let changes = vec![
+            FileChange {
+                path: "src/very_long_module_name_with_details.rs".to_string(),
+                status: FileStatus::Modified,
+                added: 60,
+                deleted: 20,
+                category: Category::Code,
+            },
+            FileChange {
+                path: "docs/README_with_many_words_and_explanations.md".to_string(),
+                status: FileStatus::Modified,
+                added: 10,
+                deleted: 2,
+                category: Category::Docs,
+            },
+        ];
+        let stats = compute_stats(&changes);
+        let subject = build_subject(&changes, &stats);
+        assert!(subject.starts_with("chore: update "));
+        assert!(subject.len() <= 72);
+    }
+
+    #[test]
+    fn sanitize_json_blob_extracts_from_markdown_fence() {
+        let raw = "```json\n{\"subject\":\"feat: update cli\",\"body\":[\"one\",\"two\"]}\n```";
+        let blob = sanitize_json_blob(raw).expect("expected JSON blob");
+        assert_eq!(
+            blob,
+            "{\"subject\":\"feat: update cli\",\"body\":[\"one\",\"two\"]}"
+        );
+    }
+
+    #[test]
+    fn coerce_body_normalizes_arrays_and_nested_bullets() {
+        let arr = json!(["added --dry-run example", "- tightened docs wording"]);
+        assert_eq!(
+            coerce_body(Some(&arr)),
+            "- added --dry-run example\n- tightened docs wording"
+        );
+
+        let nested = json!({"bullets": ["- one", "two"]});
+        assert_eq!(coerce_body(Some(&nested)), "- one\n- two");
+    }
+
+    #[test]
+    fn build_body_formats_rename_entries() {
+        let changes = vec![FileChange {
+            path: "src/new_name.rs".to_string(),
+            status: FileStatus::Renamed {
+                from: "src/old_name.rs".to_string(),
+                to: "src/new_name.rs".to_string(),
+            },
+            added: 7,
+            deleted: 2,
+            category: Category::Code,
+        }];
+        let stats = compute_stats(&changes);
+        let body = build_body(&changes, &stats);
+        assert!(body.contains("- rename src/old_name.rs -> src/new_name.rs (+7/-2) [code]"));
+    }
+
+    #[test]
+    fn build_body_reports_unlisted_files_when_changes_exceed_limit() {
+        let mut changes = Vec::new();
+        for idx in 0..13u32 {
+            changes.push(FileChange {
+                path: format!("src/file_{idx}.rs"),
+                status: FileStatus::Modified,
+                added: idx + 1,
+                deleted: 0,
+                category: Category::Code,
+            });
+        }
+        let stats = compute_stats(&changes);
+        let body = build_body(&changes, &stats);
+
+        assert!(body.contains("- ... 1 more file(s) not listed"));
+        assert!(body.contains("src/file_11.rs"));
+        assert!(!body.contains("src/file_12.rs (+13/-0) [code]"));
+    }
+}
